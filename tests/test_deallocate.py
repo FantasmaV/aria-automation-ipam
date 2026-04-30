@@ -4,12 +4,14 @@ import sys
 import os
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../abx-actions/deallocate-ip'))
-import handler
+import allocate as handler
+import deallocate as handler
+
 
 class TestDeallocateIP:
 
     def test_handler_success(self):
-        with patch('handler.delete_ip') as mock_delete:
+        with patch('deallocate.delete_ip') as mock_delete:
             result = handler.handler(context=None, inputs={
                 'address': '10.10.10.55',
                 'resourceName': 'test-vm-01'
@@ -23,7 +25,7 @@ class TestDeallocateIP:
         assert result['deallocationStatus'] == 'skipped'
 
     def test_handler_raises_on_delete_failure(self):
-        with patch('handler.delete_ip', side_effect=ValueError("Not found")):
+        with patch('deallocate.delete_ip', side_effect=ValueError("Not found")):
             with pytest.raises(ValueError):
                 handler.handler(context=None, inputs={
                     'address': '10.10.10.55',
