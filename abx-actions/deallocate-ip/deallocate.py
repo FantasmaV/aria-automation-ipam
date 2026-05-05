@@ -1,17 +1,15 @@
 """
-allocate.py
------------
-Aria Automation ABX Action — phpIPAM IP Address Allocation
+deallocate.py
+-------------
+Aria Automation ABX Action — phpIPAM IP Address Deallocation
 
-Triggered during VM provisioning to dynamically allocate the next available
-IP address from a designated phpIPAM subnet and register it with the
-requested hostname.
+Triggered during VM destruction/deprovisioning to release the IP address
+previously allocated to a resource back to the phpIPAM subnet pool.
 
 Environment Variables (set in Aria Automation ABX Action properties):
     IPAM_URL        Base URL of the phpIPAM API (e.g. https://ipam.lab.local/api)
     IPAM_APP_ID     phpIPAM application ID (e.g. aria)
     IPAM_TOKEN      phpIPAM static API token
-    SUBNET_ID       Target subnet ID for allocation (e.g. 3)
     IPAM_VERIFY_SSL Set to "false" to disable SSL verification (lab/dev only)
 
 Author: Randolph Barden
@@ -29,18 +27,17 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 # ── Constants ──────────────────────────────────────────────────────────────────
-IPAM_URL     = os.environ.get("IPAM_URL", "https://your-phpipam-server/api")
-IPAM_APP_ID  = os.environ.get("IPAM_APP_ID", "aria")
-IPAM_TOKEN   = os.environ.get("IPAM_TOKEN", "")
-SUBNET_ID    = os.environ.get("SUBNET_ID", "3")
-VERIFY_SSL   = os.environ.get("IPAM_VERIFY_SSL", "true").lower() != "false"
+IPAM_URL    = os.environ.get("IPAM_URL", "https://your-phpipam-server/api")
+IPAM_APP_ID = os.environ.get("IPAM_APP_ID", "aria")
+IPAM_TOKEN  = os.environ.get("IPAM_TOKEN", "")
+VERIFY_SSL  = os.environ.get("IPAM_VERIFY_SSL", "true").lower() != "false"
 
 # Retry strategy: 3 attempts, backoff on 500/502/503/504
 _RETRY_STRATEGY = Retry(
     total=3,
     backoff_factor=1,
     status_forcelist=[500, 502, 503, 504],
-    allowed_methods=["GET", "POST"],
+    allowed_methods=["GET", "DELETE"],
 )
 
 
@@ -75,122 +72,137 @@ def _get_session() -> requests.Session:
 # ── ABX Entry Point ────────────────────────────────────────────────────────────
 def handler(context, inputs: dict) -> dict:
     """
-    ABX handler called by Aria Automation during resource provisioning.
+    ABX handler called by Aria Automation during resource destruction.
 
     Args:
         context: Aria Automation execution context (unused directly).
         inputs:  Dictionary of inputs passed from the Aria blueprint.
                  Expected keys:
-                   - resourceName (str): VM or resource name used as hostname.
+                   - ipAddress (str):    The IP address to release.
+                   - resourceName (str): VM or resource name for logging.
 
     Returns:
         dict with keys:
-          - ipAddress (str):        Allocated IP address.
-          - allocationStatus (str): "success" on successful allocation.
-          - subnetId (str):         Subnet the IP was allocated from.
+          - ipAddress (str):          The IP address that was released.
+          - deallocationStatus (str): "success" on successful release.
     """
+    ip_address    = inputs.get("ipAddress", "")
     resource_name = inputs.get("resourceName", "unknown-vm")
-    logger.info(f"[allocate] Starting IP allocation for resource: {resource_name}")
+
+    logger.info(f"[deallocate] Starting IP release for resource: {resource_name} — IP: {ip_address}")
+
+    if not ip_address:
+        raise ValueError(
+            "Input 'ipAddress' is required for deallocation but was not provided."
+        )
 
     try:
-        session   = _get_session()
-        ip_address = allocate_ip(session, resource_name)
+        session = _get_session()
+        deallocate_ip(session, ip_address, resource_name)
 
-        logger.info(f"[allocate] Successfully allocated {ip_address} for {resource_name}")
+        logger.info(f"[deallocate] Successfully released {ip_address} for {resource_name}")
         return {
-            "ipAddress":        ip_address,
-            "allocationStatus": "success",
-            "subnetId":         SUBNET_ID,
+            "ipAddress":          ip_address,
+            "deallocationStatus": "success",
         }
 
     except EnvironmentError as e:
-        logger.error(f"[allocate] Configuration error: {e}")
+        logger.error(f"[deallocate] Configuration error: {e}")
         raise
 
     except requests.exceptions.ConnectionError as e:
-        logger.error(f"[allocate] Cannot reach phpIPAM at {IPAM_URL}: {e}")
+        logger.error(f"[deallocate] Cannot reach phpIPAM at {IPAM_URL}: {e}")
         raise
 
     except requests.exceptions.Timeout:
-        logger.error(f"[allocate] Request to phpIPAM timed out.")
+        logger.error(f"[deallocate] Request to phpIPAM timed out.")
         raise
 
     except requests.exceptions.HTTPError as e:
-        logger.error(f"[allocate] HTTP error from phpIPAM: {e.response.status_code} — {e.response.text}")
+        logger.error(f"[deallocate] HTTP error from phpIPAM: {e.response.status_code} — {e.response.text}")
         raise
 
     except ValueError as e:
-        logger.error(f"[allocate] phpIPAM API returned an error: {e}")
+        logger.error(f"[deallocate] phpIPAM API returned an error: {e}")
         raise
 
     except Exception as e:
-        logger.error(f"[allocate] Unexpected error during allocation: {e}")
+        logger.error(f"[deallocate] Unexpected error during deallocation: {e}")
         raise
 
 
-# ── Core Allocation Logic ──────────────────────────────────────────────────────
-def allocate_ip(session: requests.Session, hostname: str) -> str:
+# ── Core Deallocation Logic ────────────────────────────────────────────────────
+def deallocate_ip(session: requests.Session, ip_address: str, resource_name: str) -> None:
     """
-    Allocate the next available IP address from the target subnet in phpIPAM
-    and register it with the provided hostname.
+    Look up and delete an IP address record from phpIPAM by IP address.
 
     Steps:
-        1. Query phpIPAM for the first free IP in SUBNET_ID.
-        2. Register (reserve) that IP with the given hostname.
+        1. Search phpIPAM for the address record matching ip_address.
+        2. Extract the internal phpIPAM address ID.
+        3. DELETE the address record to return it to the subnet pool.
 
     Args:
-        session:  Authenticated requests.Session with retry logic applied.
-        hostname: Hostname to associate with the allocated IP in phpIPAM.
+        session:       Authenticated requests.Session with retry logic applied.
+        ip_address:    The IP address string to release (e.g. "192.168.10.45").
+        resource_name: Resource name used for log context only.
 
     Returns:
-        str: The allocated IP address (e.g. "192.168.10.45").
+        None
 
     Raises:
-        ValueError:               If phpIPAM returns a non-200 application code.
+        ValueError:               If the IP is not found in phpIPAM or the
+                                  API returns an unexpected response code.
         requests.HTTPError:       If the HTTP response status indicates failure.
         requests.ConnectionError: If phpIPAM is unreachable.
         requests.Timeout:         If the request exceeds the timeout threshold.
     """
-    # Step 1 — Get first free IP from subnet
-    first_free_url = f"{IPAM_URL}/{IPAM_APP_ID}/subnets/{SUBNET_ID}/first_free/"
-    logger.info(f"[allocate] Querying first free IP — subnet {SUBNET_ID}")
+    # Step 1 — Search for the address record by IP
+    search_url = f"{IPAM_URL}/{IPAM_APP_ID}/addresses/search/{ip_address}/"
+    logger.info(f"[deallocate] Searching phpIPAM for IP: {ip_address}")
 
-    response = session.get(first_free_url, timeout=(10, 30))
+    response = session.get(search_url, timeout=(10, 30))
     response.raise_for_status()
 
     data = response.json()
 
     if data.get("code") != 200:
         raise ValueError(
-            f"phpIPAM returned code {data.get('code')}: {data.get('message', 'no message')}"
+            f"phpIPAM search returned code {data.get('code')}: "
+            f"{data.get('message', 'IP address not found in phpIPAM')}"
         )
 
-    ip_address = data.get("data")
-    if not ip_address:
+    records = data.get("data", [])
+    if not records:
         raise ValueError(
-            f"phpIPAM returned success but no IP address in response: {data}"
+            f"No phpIPAM record found for IP {ip_address}. "
+            f"It may have already been released or was never registered."
         )
 
-    logger.info(f"[allocate] First free IP identified: {ip_address}")
-
-    # Step 2 — Reserve the IP with hostname
-    reserve_url = f"{IPAM_URL}/{IPAM_APP_ID}/addresses/"
-    payload = {
-        "subnetId": SUBNET_ID,
-        "ip":       ip_address,
-        "hostname": hostname,
-    }
-
-    logger.info(f"[allocate] Reserving {ip_address} with hostname '{hostname}'")
-    reserve_response = session.post(reserve_url, json=payload, timeout=(10, 30))
-    reserve_response.raise_for_status()
-
-    reserve_data = reserve_response.json()
-    if reserve_data.get("code") != 201:
+    # Step 2 — Extract the phpIPAM internal address ID
+    address_id = records[0].get("id")
+    if not address_id:
         raise ValueError(
-            f"phpIPAM reservation failed — code {reserve_data.get('code')}: "
-            f"{reserve_data.get('message', 'no message')}"
+            f"phpIPAM returned a record for {ip_address} but it contained no 'id' field: {records[0]}"
         )
 
-    logger.info(f"[allocate] IP {ip_address} successfully reserved in phpIPAM.")
-    return ip_address
+    logger.info(f"[deallocate] Found phpIPAM record ID {address_id} for IP {ip_address}")
+
+    # Step 3 — Delete the address record
+    delete_url = f"{IPAM_URL}/{IPAM_APP_ID}/addresses/{address_id}/"
+    logger.info(f"[deallocate] Deleting phpIPAM record ID {address_id}")
+
+    delete_response = session.delete(delete_url, timeout=(10, 30))
+    delete_response.raise_for_status()
+
+    delete_data = delete_response.json()
+
+    if delete_data.get("code") != 200:
+        raise ValueError(
+            f"phpIPAM deletion failed — code {delete_data.get('code')}: "
+            f"{delete_data.get('message', 'no message')}"
+        )
+
+    logger.info(
+        f"[deallocate] IP {ip_address} (record ID {address_id}) "
+        f"successfully released from phpIPAM for resource '{resource_name}'."
+    )
